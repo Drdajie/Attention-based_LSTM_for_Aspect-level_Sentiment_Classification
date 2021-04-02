@@ -131,22 +131,21 @@ class Attention(nn.Module):
         '''
         super(Attention, self).__init__()
         if hidden_dim is None:
-             hidden_dim = embed_dim # * n_head
+             hidden_dim = embed_dim // n_head
         if out_dim is None:
             out_dim = embed_dim
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
         self.n_head = n_head
         self.score_function = score_function
-        #self.w_k = nn.Linear(embed_dim, n_head * hidden_dim)
-        #self.w_q = nn.Linear(embed_dim, n_head * hidden_dim)
-        #self.proj = nn.Linear(n_head * hidden_dim, out_dim)
+        self.w_k = nn.Linear(embed_dim, n_head * hidden_dim)
+        self.w_q = nn.Linear(embed_dim, n_head * hidden_dim)
+        self.proj = nn.Linear(n_head * hidden_dim, out_dim)
         self.proj = nn.Linear(embed_dim,out_dim)
         self.dropout = nn.Dropout(dropout)
         if score_function == 'mlp':
             self.weight = nn.Parameter(torch.Tensor(hidden_dim*2))
         elif self.score_function == 'bi_linear':
-            #self.weight = nn.Parameter(torch.Tensor(hidden_dim, hidden_dim))
             self.weight = nn.Parameter(torch.Tensor(hidden_dim, hidden_dim))
         else:  # dot_product / scaled_dot_product
             self.register_parameter('weight', None)
@@ -173,38 +172,32 @@ class Attention(nn.Module):
         # qx: (n_head*?, q_len, hidden_dim)
         # score: (n_head*?, q_len, k_len,)
         # output: (?, q_len, out_dim,)
-        #kx = self.w_k(k).view(mb_size, k_len, self.n_head, self.hidden_dim)
-        #kx = kx.permute(2, 0, 1, 3).contiguous().view(-1, k_len, self.hidden_dim)
-        #qx = self.w_q(q).view(mb_size, q_len, self.n_head, self.hidden_dim)
-        #qx = qx.permute(2, 0, 1, 3).contiguous().view(-1, q_len, self.hidden_dim)
+        kx = self.w_k(k).view(mb_size, k_len, self.n_head, self.hidden_dim)
+        kx = kx.permute(2, 0, 1, 3).contiguous().view(-1, k_len, self.hidden_dim)
+        qx = self.w_q(q).view(mb_size, q_len, self.n_head, self.hidden_dim)
+        qx = qx.permute(2, 0, 1, 3).contiguous().view(-1, q_len, self.hidden_dim)
         if self.score_function == 'dot_product':
-            # kt = kx.permute(0, 2, 1)
-            # score = torch.bmm(qx, kt)
-            kt = k.permute(0,2,1)
-            score = torch.bmm(q,kt)
-        # elif self.score_function == 'scaled_dot_product':
-        #     kt = kx.permute(0, 2, 1)
-        #     qkt = torch.bmm(qx, kt)
-        #     score = torch.div(qkt, math.sqrt(self.hidden_dim))
-        # elif self.score_function == 'mlp':
-        #     kxx = torch.unsqueeze(kx, dim=1).expand(-1, q_len, -1, -1)
-        #     qxx = torch.unsqueeze(qx, dim=2).expand(-1, -1, k_len, -1)
-        #     kq = torch.cat((kxx, qxx), dim=-1)  # (n_head*?, q_len, k_len, hidden_dim*2)
-        #     # kq = torch.unsqueeze(kx, dim=1) + torch.unsqueeze(qx, dim=2)
-        #     score = F.tanh(torch.matmul(kq, self.weight))
+            kt = kx.permute(0, 2, 1)
+            score = torch.bmm(qx, kt)
+        elif self.score_function == 'scaled_dot_product':
+            kt = kx.permute(0, 2, 1)
+            qkt = torch.bmm(qx, kt)
+            score = torch.div(qkt, math.sqrt(self.hidden_dim))
+        elif self.score_function == 'mlp':
+            kxx = torch.unsqueeze(kx, dim=1).expand(-1, q_len, -1, -1)
+            qxx = torch.unsqueeze(qx, dim=2).expand(-1, -1, k_len, -1)
+            kq = torch.cat((kxx, qxx), dim=-1)  # (n_head*?, q_len, k_len, hidden_dim*2)
+            # kq = torch.unsqueeze(kx, dim=1) + torch.unsqueeze(qx, dim=2)
+            score = F.tanh(torch.matmul(kq, self.weight))
         elif self.score_function == 'bi_linear':
-            # qw = torch.matmul(qx, self.weight)
-            # kt = kx.permute(0, 2, 1)
-            # score = torch.bmm(qw, kt)
-            qw = torch.matmul(q,self.weight)
-            kt = k.permute(0,2,1)
-            score = torch.bmm(qw,kt)
+            qw = torch.matmul(qx, self.weight)
+            kt = kx.permute(0, 2, 1)
+            score = torch.bmm(qw, kt)
         else:
             raise RuntimeError('invalid score_function')
         score = F.softmax(score, dim=-1)
-        output = torch.bmm(score, k)#x)  # (n_head*?, q_len, hidden_dim)
-        #output = torch.cat(torch.split(output, mb_size, dim=0), dim=-1)  # (?, q_len, n_head*hidden_dim)
-        output = torch.cat(torch.split(output,1,dim=1),dim=-1)
+        output = torch.bmm(score, kx)  # (n_head*?, q_len, hidden_dim)
+        output = torch.cat(torch.split(output, mb_size, dim=0), dim=-1)  # (?, q_len, n_head*hidden_dim)
         output = self.proj(output)  # (?, q_len, out_dim)
         output = self.dropout(output)
         return output, score
